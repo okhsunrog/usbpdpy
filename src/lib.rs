@@ -768,25 +768,35 @@ pub fn parse_pd_message_with_state(
     let mut state_manager = PdoStateManager::new();
     
     // If PDO state is provided, convert to SourceCapabilities
-    if let Some(pdos) = pdo_state {
-        // Create a dummy source capabilities message to extract the real SourceCapabilities
-        // This is a bit of a hack, but we need to work with the Rust API
-        let _dummy_header = Header(0x0161); // Source Capabilities with 6 objects
-        let mut dummy_payload = Vec::new();
-        
-        // Add each PDO as raw u32 (this is a simplified approach)
-        for pdo in &pdos {
-            dummy_payload.extend_from_slice(&pdo.raw.to_le_bytes());
-        }
-        
-        // Create dummy message bytes
-        let mut dummy_bytes = vec![0x61, 0x01]; // Header bytes
-        dummy_bytes.extend(dummy_payload);
-        
-        // Parse to extract SourceCapabilities
-        if let Ok(dummy_msg) = Message::from_bytes(&dummy_bytes) {
-            if let Some(Data::SourceCapabilities(caps)) = dummy_msg.data {
-                state_manager.update_source_capabilities(caps);
+    if let Some(ref pdos) = pdo_state {
+        if !pdos.is_empty() && pdos.len() <= 7 {
+            // Build a proper PD header for Source_Capabilities with correct num_objects
+            // USB PD Header format (16-bit little-endian):
+            // Bits 0-4: Message type (1 = Source_Capabilities for data messages)
+            // Bit 5: Port data role (1 = DFP)
+            // Bits 6-7: Spec revision (2 = PD3.0)
+            // Bit 8: Port power role (1 = Source)
+            // Bits 9-11: Message ID (0)
+            // Bits 12-14: Number of data objects
+            // Bit 15: Extended (0)
+            let num_objects = pdos.len() as u16;
+            let header: u16 = 1                    // message_type = Source_Capabilities
+                | (1 << 5)                         // port_data_role = DFP
+                | (2 << 6)                         // spec_revision = PD3.0
+                | (1 << 8)                         // port_power_role = Source
+                | (num_objects << 12);             // num_data_objects
+
+            // Build dummy message bytes: header (2 bytes) + PDOs (4 bytes each)
+            let mut dummy_bytes = header.to_le_bytes().to_vec();
+            for pdo in pdos {
+                dummy_bytes.extend_from_slice(&pdo.raw.to_le_bytes());
+            }
+
+            // Parse to extract SourceCapabilities
+            if let Ok(dummy_msg) = Message::from_bytes(&dummy_bytes) {
+                if let Some(Data::SourceCapabilities(caps)) = dummy_msg.data {
+                    state_manager.update_source_capabilities(caps);
+                }
             }
         }
     }

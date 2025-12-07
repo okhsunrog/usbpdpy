@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "usbpdpy"
 description = "Python bindings for USB Power Delivery protocol message parsing"
-version = "0.2.0"
+version = "0.2.1"
 authors = [
     {name = "Danila Gornushko", email = "me@okhsunrog.dev"},
 ]
