@@ -299,7 +299,7 @@ checksum = "eb833a30f3065623f4f7150f61dceb698b8a5f3b93ccfe7b7c69ed479f63bcd6"
 
 [[package]]
 name = "usbpdpy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hex",
  "pyo3",

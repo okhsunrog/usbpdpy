@@ -290,6 +290,87 @@ class TestEprRequest:
         )
 
 
+# Source: km003c-protocol-research, capture pd_epr0.9 frame 1099 - a 32-byte
+# EPR_Source_Capabilities sent as a 26-byte chunk, the sink's request for chunk
+# 1, and the final 6-byte chunk.
+EPR_SOURCE_CAPS_CHUNKS = [
+    "b1fb20802c91812b2cd102002cc103002cb10400f44106006421a4c90000",
+    "9194008c0000",
+    "b1ad20880000f4c10800",
+]
+
+
+class TestPdDecoder:
+    """PdDecoder keeps the state that single-message parsing lacks."""
+
+    def test_resolves_a_request_against_the_preceding_capabilities(self):
+        decoder = usbpdpy.PdDecoder()
+
+        caps = decoder.decode(
+            bytes.fromhex("a1612c9101082cd102002cc103002cb10400454106003c21dcc0")
+        )
+        request = decoder.decode(bytes.fromhex("8210dc700323"))
+
+        assert len(decoder.source_capabilities) == len(caps.data_objects) == 6
+        assert request.header.message_type == "Request"
+        assert len(request.request_objects) == 1
+        assert request.request_objects[0].object_position == 2
+        assert request.request_objects[0].raw == 0x230370DC
+
+    def test_leaves_a_request_unresolved_before_any_capabilities(self):
+        request = usbpdpy.PdDecoder().decode(bytes.fromhex("8210dc700323"))
+
+        assert request.header.message_type == "Request"
+        assert request.request_objects == []
+
+    def test_reassembles_chunked_epr_source_capabilities(self):
+        decoder = usbpdpy.PdDecoder()
+
+        first, chunk_request, last = (
+            decoder.decode(bytes.fromhex(chunk)) for chunk in EPR_SOURCE_CAPS_CHUNKS
+        )
+
+        assert first is None
+        assert chunk_request is None
+        assert last.header.message_type == "EPR_Source_Capabilities"
+        assert last.raw_bytes == bytes.fromhex(EPR_SOURCE_CAPS_CHUNKS[-1])
+        # Positions 1-7 hold the SPR PDOs, zero-padded; EPR PDOs start at 8.
+        pdos = last.data_objects
+        assert [pdo.raw for pdo in pdos[5:]] == [0xC9A42164, 0, 0x0008C1F4]
+        assert pdos[0].voltage_v == pytest.approx(5.0)
+        assert pdos[7].voltage_v == pytest.approx(28.0)
+        assert pdos[7].max_current_a == pytest.approx(5.0)
+
+    def test_single_message_parsing_cannot_decode_a_chunk(self):
+        with pytest.raises(ValueError, match="ChunkedExtendedMessage"):
+            usbpdpy.parse_pd_message(bytes.fromhex(EPR_SOURCE_CAPS_CHUNKS[0]))
+
+    def test_a_new_first_chunk_restarts_assembly(self):
+        decoder = usbpdpy.PdDecoder()
+        first, _, last = (bytes.fromhex(chunk) for chunk in EPR_SOURCE_CAPS_CHUNKS)
+
+        assert decoder.decode(first) is None
+        assert decoder.decode(first) is None  # retransmitted after an abort
+        assert decoder.decode(last).header.message_type == "EPR_Source_Capabilities"
+
+    def test_rejects_a_chunk_without_its_first_chunk(self):
+        decoder = usbpdpy.PdDecoder()
+
+        with pytest.raises(ValueError):
+            decoder.decode(bytes.fromhex(EPR_SOURCE_CAPS_CHUNKS[-1]))
+
+    def test_reset_forgets_the_capabilities(self):
+        decoder = usbpdpy.PdDecoder()
+        decoder.decode(
+            bytes.fromhex("a1612c9101082cd102002cc103002cb10400454106003c21dcc0")
+        )
+
+        decoder.reset()
+
+        assert decoder.source_capabilities == []
+        assert decoder.decode(bytes.fromhex("8210dc700323")).request_objects == []
+
+
 class TestControlMessages:
     """Test various control messages"""
 
