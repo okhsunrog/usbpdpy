@@ -32,14 +32,25 @@ use pyo3::types::PyBytesMethods;
 use pyo3::exceptions::{PyValueError, PyTypeError};
 
 use usbpd::protocol_layer::message::{
-    Message, Data, ParseError, PdoState,
-    header::{Header, MessageType, DataMessageType, ControlMessageType, SpecificationRevision},
-    pdo::{PowerDataObject, Augmented, SourceCapabilities, Kind},
-    request,
+    Message, ParseError, Payload,
+    data::{Data, request},
+    data::source_capabilities::{PowerDataObject, Augmented, SourceCapabilities},
+    header::{Header, MessageType, DataMessageType, ControlMessageType, ExtendedMessageType, SpecificationRevision},
 };
 
+/// Extract the data payload of a parsed message, if it carries one.
+///
+/// usbpd 2.0.0 wraps a message body in `Payload` so that extended messages fit
+/// alongside data messages; only the data variant is exposed to Python.
+fn message_data(message: &Message) -> Option<&Data> {
+    match message.payload {
+        Some(Payload::Data(ref data)) => Some(data),
+        _ => None,
+    }
+}
+
 /// Python wrapper for USB PD message header
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PdHeader {
     #[pyo3(get)]
@@ -121,12 +132,34 @@ impl From<&Header> for PdHeader {
                 DataMessageType::VendorDefined => "Vendor_Defined",
                 DataMessageType::Reserved => "Reserved",
             },
+            MessageType::Extended(extended) => match extended {
+                ExtendedMessageType::SourceCapabilitiesExtended => "Source_Capabilities_Extended",
+                ExtendedMessageType::Status => "Status",
+                ExtendedMessageType::GetBatteryCap => "Get_Battery_Cap",
+                ExtendedMessageType::GetBatteryStatus => "Get_Battery_Status",
+                ExtendedMessageType::BatteryCapabilities => "Battery_Capabilities",
+                ExtendedMessageType::GetManufacturerInfo => "Get_Manufacturer_Info",
+                ExtendedMessageType::ManufacturerInfo => "Manufacturer_Info",
+                ExtendedMessageType::SecurityRequest => "Security_Request",
+                ExtendedMessageType::SecurityResponse => "Security_Response",
+                ExtendedMessageType::FirmwareUpdateRequest => "Firmware_Update_Request",
+                ExtendedMessageType::FirmwareUpdateResponse => "Firmware_Update_Response",
+                ExtendedMessageType::PpsStatus => "PPS_Status",
+                ExtendedMessageType::CountryInfo => "Country_Info",
+                ExtendedMessageType::CountryCodes => "Country_Codes",
+                ExtendedMessageType::SinkCapabilitiesExtended => "Sink_Capabilities_Extended",
+                ExtendedMessageType::ExtendedControl => "Extended_Control",
+                ExtendedMessageType::EprSourceCapabilities => "EPR_Source_Capabilities",
+                ExtendedMessageType::EprSinkCapabilities => "EPR_Sink_Capabilities",
+                ExtendedMessageType::VendorDefinedExtended => "Vendor_Defined_Extended",
+                ExtendedMessageType::Reserved => "Reserved",
+            },
         }.to_string();
 
         let spec_revision = match header.spec_revision() {
             Ok(SpecificationRevision::R1_0) => 0,
             Ok(SpecificationRevision::R2_0) => 1,
-            Ok(SpecificationRevision::R3_0) => 2,
+            Ok(SpecificationRevision::R3_X) => 2,
             Err(_) => 0,
         };
 
@@ -158,7 +191,7 @@ impl PdHeader {
 }
 
 /// Python wrapper for USB PD Power Data Object
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PowerDataObj {
     #[pyo3(get)]
@@ -352,7 +385,7 @@ impl PowerDataObj {
 }
 
 /// Python wrapper for USB PD Request Data Object (RDO)
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct RequestDataObj {
     #[pyo3(get)]
@@ -483,6 +516,25 @@ impl From<&request::PowerSource> for RequestDataObj {
                     giveback_flag: None,
                 }
             }
+            request::PowerSource::EprRequest(epr) => {
+                // An EPR request carries the raw RDO plus a copy of the PDO it
+                // selects, so the RDO layout follows from that PDO's type.
+                let inner = match &epr.pdo {
+                    PowerDataObject::FixedSupply(_) | PowerDataObject::VariableSupply(_) => {
+                        request::PowerSource::FixedVariableSupply(request::FixedVariableSupply(epr.rdo))
+                    }
+                    PowerDataObject::Augmented(Augmented::Epr(_)) => {
+                        request::PowerSource::Avs(request::Avs(epr.rdo))
+                    }
+                    PowerDataObject::Augmented(Augmented::Spr(_)) => {
+                        request::PowerSource::Pps(request::Pps(epr.rdo))
+                    }
+                    _ => request::PowerSource::Unknown(request::RawDataObject(epr.rdo)),
+                };
+                let mut decoded = RequestDataObj::from(&inner);
+                decoded.rdo_type = format!("EPR_{}", decoded.rdo_type);
+                decoded
+            }
             request::PowerSource::Unknown(raw) => {
                 RequestDataObj {
                     raw: raw.0,
@@ -534,52 +586,29 @@ impl RequestDataObj {
     }
 }
 
-/// PDO state manager for tracking Source Capabilities
-#[derive(Debug, Clone)]
-pub struct PdoStateManager {
-    /// Stored PDOs from most recent Source Capabilities message
-    pub source_capabilities: Option<SourceCapabilities>,
-}
+/// Parse a message, resolving Request PDO types against known capabilities.
+///
+/// A Request message only carries an object position, so its RDO cannot be
+/// interpreted without the Source Capabilities that preceded it. usbpd 2.0.0
+/// implements its `PdoKind` lookup for `Option<&SourceCapabilities>` directly,
+/// which replaces the state-manager type this crate used to define.
+fn parse_with_capabilities(
+    bytes: &[u8],
+    capabilities: Option<&SourceCapabilities>,
+) -> Result<Message, ParseError> {
+    let header = Header::from_bytes(&bytes[..2])?;
+    let message = Message::new(header);
 
-impl PdoStateManager {
-    pub fn new() -> Self {
-        Self {
-            source_capabilities: None,
+    match header.message_type() {
+        MessageType::Data(message_type) => {
+            Data::parse_message(message, message_type, &bytes[2..], &capabilities)
         }
-    }
-    
-    pub fn update_source_capabilities(&mut self, capabilities: SourceCapabilities) {
-        self.source_capabilities = Some(capabilities);
-    }
-}
-
-impl PdoState for PdoStateManager {
-    fn pdo_at_object_position(&self, position: u8) -> Option<Kind> {
-        if let Some(ref caps) = self.source_capabilities {
-            if position == 0 || position > 7 {
-                return None;
-            }
-            
-            let index = (position - 1) as usize;
-            caps.pdos().get(index).map(|pdo| match pdo {
-                PowerDataObject::FixedSupply(_) => Kind::FixedSupply,
-                PowerDataObject::Battery(_) => Kind::Battery,
-                PowerDataObject::VariableSupply(_) => Kind::VariableSupply,
-                PowerDataObject::Augmented(aug) => match aug {
-                    Augmented::Spr(_) => Kind::Pps,
-                    Augmented::Epr(_) => Kind::Avs,
-                    Augmented::Unknown(_) => Kind::FixedSupply, // Fallback
-                },
-                PowerDataObject::Unknown(_) => Kind::FixedSupply, // Fallback
-            })
-        } else {
-            None
-        }
+        _ => Message::from_bytes(bytes),
     }
 }
 
 /// Python wrapper for complete USB PD message
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PdMessage {
     #[pyo3(get)]
@@ -678,6 +707,7 @@ pub fn parse_pd_message(data: &Bound<'_, pyo3::types::PyBytes>) -> PyResult<PdMe
         Ok(message) => {
             let header = PdHeader::from(&message.header);
             let mut data_objects = Vec::new();
+            let mut request_objects = Vec::new();
             
             // Validate that the payload length matches header expectations
             let expected_len = 2 + (message.header.num_objects() * 4);
@@ -689,17 +719,21 @@ pub fn parse_pd_message(data: &Bound<'_, pyo3::types::PyBytes>) -> PyResult<PdMe
             }
             
             // Extract data objects based on message data type
-            if let Some(data) = &message.data {
+            if let Some(data) = message_data(&message) {
                 match data {
                     Data::SourceCapabilities(source_caps) => {
                         for pdo in source_caps.pdos() {
                             data_objects.push(PowerDataObj::from(pdo));
                         }
                     }
-                    Data::PowerSourceRequest(_request) => {
-                        // Basic request support without PDO state
-                        // Will be empty for now, but structure is ready
+                    // An EPR request carries a copy of the PDO it selects, so it
+                    // decodes without the preceding Source Capabilities. A plain
+                    // Request only names an object position and stays empty here;
+                    // use parse_pd_message_with_state to resolve it.
+                    Data::Request(request @ request::PowerSource::EprRequest(_)) => {
+                        request_objects.push(RequestDataObj::from(request));
                     }
+                    Data::Request(_) => {}
                     // TODO: Add support for other data types (VendorDefined, etc.)
                     _ => {
                         // For now, we only fully support Source Capabilities
@@ -711,7 +745,7 @@ pub fn parse_pd_message(data: &Bound<'_, pyo3::types::PyBytes>) -> PyResult<PdMe
             Ok(PdMessage {
                 header,
                 data_objects,
-                request_objects: Vec::new(),
+                request_objects,
                 raw_bytes: bytes.to_vec(),
             })
         }
@@ -735,6 +769,9 @@ pub fn parse_pd_message(data: &Bound<'_, pyo3::types::PyBytes>) -> PyResult<PdMe
                 ParseError::Other(msg) => {
                     format!("Parse error: {}", msg)
                 }
+                // Chunked extended messages need reassembly across several
+                // messages, which a single-message parser cannot do.
+                other => format!("Parse error: {:?}", other),
             };
             Err(PyValueError::new_err(error_msg))
         }
@@ -764,12 +801,12 @@ pub fn parse_pd_message_with_state(
         return Err(PyValueError::new_err("message too short: expected at least 2 bytes"));
     }
 
-    // Create PDO state manager
-    let mut state_manager = PdoStateManager::new();
-    
+    // Capabilities the caller supplied, used to resolve a Request RDO
+    let mut capabilities: Option<SourceCapabilities> = None;
+
     // If PDO state is provided, convert to SourceCapabilities
-    if let Some(ref pdos) = pdo_state {
-        if !pdos.is_empty() && pdos.len() <= 7 {
+    if let Some(ref pdos) = pdo_state
+        && !pdos.is_empty() && pdos.len() <= 7 {
             // Build a proper PD header for Source_Capabilities with correct num_objects
             // USB PD Header format (16-bit little-endian):
             // Bits 0-4: Message type (1 = Source_Capabilities for data messages)
@@ -793,16 +830,14 @@ pub fn parse_pd_message_with_state(
             }
 
             // Parse to extract SourceCapabilities
-            if let Ok(dummy_msg) = Message::from_bytes(&dummy_bytes) {
-                if let Some(Data::SourceCapabilities(caps)) = dummy_msg.data {
-                    state_manager.update_source_capabilities(caps);
+            if let Ok(dummy_msg) = Message::from_bytes(&dummy_bytes)
+                && let Some(Data::SourceCapabilities(caps)) = message_data(&dummy_msg) {
+                    capabilities = Some(caps.clone());
                 }
-            }
         }
-    }
 
     // Use the usbpd crate to parse the message with state
-    match Message::from_bytes_with_state(bytes, &state_manager) {
+    match parse_with_capabilities(bytes, capabilities.as_ref()) {
         Ok(message) => {
             let header = PdHeader::from(&message.header);
             let mut data_objects = Vec::new();
@@ -818,14 +853,14 @@ pub fn parse_pd_message_with_state(
             }
             
             // Extract data objects based on message data type
-            if let Some(data) = &message.data {
+            if let Some(data) = message_data(&message) {
                 match data {
                     Data::SourceCapabilities(source_caps) => {
                         for pdo in source_caps.pdos() {
                             data_objects.push(PowerDataObj::from(pdo));
                         }
                     }
-                    Data::PowerSourceRequest(request) => {
+                    Data::Request(request) => {
                         request_objects.push(RequestDataObj::from(request));
                     }
                     // TODO: Add support for other data types (VendorDefined, etc.)
@@ -863,6 +898,9 @@ pub fn parse_pd_message_with_state(
                 ParseError::Other(msg) => {
                     format!("Parse error: {}", msg)
                 }
+                // Chunked extended messages need reassembly across several
+                // messages, which a single-message parser cannot do.
+                other => format!("Parse error: {:?}", other),
             };
             Err(PyValueError::new_err(error_msg))
         }
@@ -884,8 +922,8 @@ pub fn parse_messages(messages: &Bound<'_, pyo3::types::PyList>) -> PyResult<Vec
     let mut parsed_messages = Vec::new();
     
     for item in messages.iter() {
-        if let Ok(bytes) = item.downcast::<pyo3::types::PyBytes>() {
-            match parse_pd_message(&bytes) {
+        if let Ok(bytes) = item.cast::<pyo3::types::PyBytes>() {
+            match parse_pd_message(bytes) {
                 Ok(msg) => parsed_messages.push(msg),
                 Err(_) => {
                     // Skip failed messages, continue with others
@@ -999,7 +1037,7 @@ pub fn get_message_type_name(message_type: u8, num_data_objects: u8) -> String {
 /// the proven usbpd Rust crate.
 #[pymodule]
 fn usbpdpy(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add("__version__", "0.1.0")?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("__author__", "Danila Gornushko <me@okhsunrog.dev>")?;
     
     // Functions
