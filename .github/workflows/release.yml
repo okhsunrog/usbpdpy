@@ -1,0 +1,134 @@
+name: Release
+
+# Tag push (v*) builds usbpdpy wheels for every supported platform plus a
+# source distribution and publishes them to PyPI. workflow_dispatch performs
+# the same builds for verification; set publish-pypi to also upload them.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish-pypi:
+        description: "Upload the built distributions to PyPI"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate tag against the crate version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          if [[ -z "$version" ]]; then
+            echo "::error::Could not read the crate version"
+            exit 1
+          fi
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match crate version v${version}"
+            exit 1
+          fi
+
+  wheels:
+    name: Wheel ${{ matrix.platform }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            target: x86_64
+          - os: ubuntu-latest
+            platform: linux-aarch64
+            target: aarch64
+          - os: macos-latest
+            platform: macos-x86_64
+            target: x86_64
+          - os: macos-latest
+            platform: macos-aarch64
+            target: aarch64
+          - os: windows-latest
+            platform: windows-x86_64
+            target: x64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # pyo3 is built with abi3-py38, so one wheel per platform covers every
+      # CPython from 3.8 up and new interpreter releases need no rebuild.
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist
+          manylinux: auto
+          sccache: "true"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.platform }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Source distribution
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  pypi:
+    name: Publish to PyPI
+    # Tags publish automatically. A manual run only publishes when asked, so
+    # the same workflow can be used to verify the build without uploading.
+    if: startsWith(github.ref, 'refs/tags/') || inputs.publish-pypi
+    needs:
+      - wheels
+      - sdist
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Trusted publishing mints a short-lived OIDC token, so no PyPI secret
+      # is stored in this repository.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # A version is uploaded file by file, so a run that fails partway
+          # leaves some files already published. Skipping those lets a rerun
+          # deliver the rest instead of failing on the first duplicate.
+          skip-existing: true

@@ -17,6 +17,9 @@ Python bindings for USB Power Delivery message parsing using the [`usbpd`](https
 pip install usbpdpy
 ```
 
+Wheels are built against the stable ABI for Linux, macOS and Windows on x86-64 and
+arm64, so one wheel per platform covers CPython 3.8 and newer.
+
 ## Quick Start
 
 ### Parse Source Capabilities
@@ -103,9 +106,10 @@ for rdo in request_msg.request_objects:
 - `unconstrained_power: Optional[bool]` - Unconstrained power flag
 
 **RequestDataObj**
-- `rdo_type: str` - "FixedVariableSupply", "Battery", "PPS", "AVS", "Unknown"
+- `rdo_type: str` - "FixedVariableSupply", "Battery", "PPS", "AVS", "Unknown", or the
+  same names prefixed with `EPR_` for an EPR_Request (e.g. "EPR_FixedVariableSupply")
 - `raw: int` - Raw 32-bit RDO value
-- `object_position: int` - PDO position being requested (1-7)
+- `object_position: int` - PDO position being requested (1-7, up to 13 in EPR mode)
 - `operating_current_a: Optional[float]` - Operating current in amperes
 - `max_operating_current_a: Optional[float]` - Maximum operating current in amperes
 - `operating_voltage_v: Optional[float]` - Operating voltage in volts (PPS/AVS)
@@ -127,6 +131,8 @@ The library correctly distinguishes between control and data messages:
 
 - **Source_Capabilities**: Parsed into `data_objects` (PDOs)
 - **Request**: Parsed into `request_objects` (RDOs) when PDO state is provided
+- **EPR_Request**: Parsed into `request_objects` even without PDO state, because the
+  message carries a copy of the PDO it selects
 - **Sink_Capabilities**: Header parsed, data objects pending
 - **Other data messages**: Header parsed, data objects pending
 
