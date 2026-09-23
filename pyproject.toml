@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "usbpdpy"
 description = "Python bindings for USB Power Delivery protocol message parsing"
-version = "0.2.1"
+dynamic = ["version"]
 authors = [
     {name = "Danila Gornushko", email = "me@okhsunrog.dev"},
 ]
@@ -40,6 +40,17 @@ Documentation = "https://github.com/okhsunrog/usbpdpy#readme"
 
 [tool.maturin]
 module-name = "usbpdpy"
+
+[tool.uv]
+# uv reinstalls this project from its build cache on every `uv run`, and by
+# default only pyproject.toml invalidates that cache. Without the Rust sources
+# listed here, `uv run pytest` silently tests a stale build of the extension.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "src/**/*.rs" },
+]
 
 [dependency-groups]
 dev = [

@@ -170,3 +170,11 @@ class TestUseCases:
 
         # Should round-trip correctly
         assert original_hex.lower() == converted_hex.lower()
+
+
+def test_module_version_matches_the_installed_package():
+    # __version__ used to be a hardcoded "0.1.0" that had drifted from the
+    # published package version; it now comes from Cargo.toml.
+    from importlib.metadata import version
+
+    assert usbpdpy.__version__ == version("usbpdpy")

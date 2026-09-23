@@ -20,56 +20,70 @@
 //! # Parse a Source Capabilities message
 //! message_bytes = bytes.fromhex("a1612c9101082cd102002cc103002cb10400454106003c21dcc0")
 //! message = usbpdpy.parse_message(message_bytes)
-//! 
+//!
 //! print(f"Message type: {message.message_type}")
 //! print(f"Power objects: {len(message.data_objects)}")
 //! for pdo in message.data_objects:
 //!     print(f"  {pdo}")
 //! ```
 
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytesMethods;
-use pyo3::exceptions::{PyValueError, PyTypeError};
 
 use usbpd::protocol_layer::message::{
-    Message, Data, ParseError, PdoState,
-    header::{Header, MessageType, DataMessageType, ControlMessageType, SpecificationRevision},
-    pdo::{PowerDataObject, Augmented, SourceCapabilities, Kind},
-    request,
+    Message, ParseError, Payload,
+    data::source_capabilities::{Augmented, PowerDataObject, SourceCapabilities},
+    data::{Data, request},
+    header::{
+        ControlMessageType, DataMessageType, ExtendedMessageType, Header, MessageType,
+        SpecificationRevision,
+    },
 };
 
+/// Extract the data payload of a parsed message, if it carries one.
+///
+/// usbpd 2.0.0 wraps a message body in `Payload` so that extended messages fit
+/// alongside data messages; only the data variant is exposed to Python.
+fn message_data(message: &Message) -> Option<&Data> {
+    match message.payload {
+        Some(Payload::Data(ref data)) => Some(data),
+        _ => None,
+    }
+}
+
 /// Python wrapper for USB PD message header
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PdHeader {
     #[pyo3(get)]
     /// Message type as human-readable string (e.g., "Source_Capabilities", "GoodCRC")
     pub message_type: String,
-    
+
     #[pyo3(get)]
     /// Raw message type value
     pub message_type_raw: u8,
-    
+
     #[pyo3(get)]
     /// Port data role ("Ufp" or "Dfp")
     pub port_data_role: String,
-    
+
     #[pyo3(get)]
     /// USB PD specification revision (0=R1.0, 1=R2.0, 2=R3.0)
     pub spec_revision: u8,
-    
+
     #[pyo3(get)]
     /// Port power role ("Sink" or "Source")
     pub port_power_role: String,
-    
+
     #[pyo3(get)]
     /// Message ID (0-7)
     pub message_id: u8,
-    
+
     #[pyo3(get)]
     /// Number of data objects (0-7)
     pub num_data_objects: u8,
-    
+
     #[pyo3(get)]
     /// Extended message flag
     pub extended: bool,
@@ -121,12 +135,35 @@ impl From<&Header> for PdHeader {
                 DataMessageType::VendorDefined => "Vendor_Defined",
                 DataMessageType::Reserved => "Reserved",
             },
-        }.to_string();
+            MessageType::Extended(extended) => match extended {
+                ExtendedMessageType::SourceCapabilitiesExtended => "Source_Capabilities_Extended",
+                ExtendedMessageType::Status => "Status",
+                ExtendedMessageType::GetBatteryCap => "Get_Battery_Cap",
+                ExtendedMessageType::GetBatteryStatus => "Get_Battery_Status",
+                ExtendedMessageType::BatteryCapabilities => "Battery_Capabilities",
+                ExtendedMessageType::GetManufacturerInfo => "Get_Manufacturer_Info",
+                ExtendedMessageType::ManufacturerInfo => "Manufacturer_Info",
+                ExtendedMessageType::SecurityRequest => "Security_Request",
+                ExtendedMessageType::SecurityResponse => "Security_Response",
+                ExtendedMessageType::FirmwareUpdateRequest => "Firmware_Update_Request",
+                ExtendedMessageType::FirmwareUpdateResponse => "Firmware_Update_Response",
+                ExtendedMessageType::PpsStatus => "PPS_Status",
+                ExtendedMessageType::CountryInfo => "Country_Info",
+                ExtendedMessageType::CountryCodes => "Country_Codes",
+                ExtendedMessageType::SinkCapabilitiesExtended => "Sink_Capabilities_Extended",
+                ExtendedMessageType::ExtendedControl => "Extended_Control",
+                ExtendedMessageType::EprSourceCapabilities => "EPR_Source_Capabilities",
+                ExtendedMessageType::EprSinkCapabilities => "EPR_Sink_Capabilities",
+                ExtendedMessageType::VendorDefinedExtended => "Vendor_Defined_Extended",
+                ExtendedMessageType::Reserved => "Reserved",
+            },
+        }
+        .to_string();
 
         let spec_revision = match header.spec_revision() {
             Ok(SpecificationRevision::R1_0) => 0,
             Ok(SpecificationRevision::R2_0) => 1,
-            Ok(SpecificationRevision::R3_0) => 2,
+            Ok(SpecificationRevision::R3_X) => 2,
             Err(_) => 0,
         };
 
@@ -153,50 +190,53 @@ impl PdHeader {
     }
 
     fn __str__(&self) -> String {
-        format!("{} (ID: {}, Objects: {})", self.message_type, self.message_id, self.num_data_objects)
+        format!(
+            "{} (ID: {}, Objects: {})",
+            self.message_type, self.message_id, self.num_data_objects
+        )
     }
 }
 
 /// Python wrapper for USB PD Power Data Object
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PowerDataObj {
     #[pyo3(get)]
     /// Raw 32-bit PDO value
     pub raw: u32,
-    
+
     #[pyo3(get)]
     /// PDO type ("FixedSupply", "Battery", "VariableSupply", "PPS", "Unknown")
     pub pdo_type: String,
-    
+
     #[pyo3(get)]
     /// Voltage in volts (for fixed/variable supply)
     pub voltage_v: Option<f32>,
-    
+
     #[pyo3(get)]
     /// Maximum current in amperes
     pub max_current_a: Option<f32>,
-    
+
     #[pyo3(get)]
     /// Maximum power in watts (calculated for fixed supply)
     pub max_power_w: Option<f32>,
-    
+
     #[pyo3(get)]
     /// Minimum voltage in volts (for PPS/variable supply)
     pub min_voltage_v: Option<f32>,
-    
+
     #[pyo3(get)]
     /// Maximum voltage in volts (for PPS/variable supply)
     pub max_voltage_v: Option<f32>,
-    
+
     #[pyo3(get)]
     /// Dual role power capability
     pub dual_role_power: Option<bool>,
-    
+
     #[pyo3(get)]
     /// USB communications capability
     pub usb_communications_capable: Option<bool>,
-    
+
     #[pyo3(get)]
     /// Unconstrained power
     pub unconstrained_power: Option<bool>,
@@ -279,39 +319,9 @@ impl From<&PowerDataObject> for PowerDataObj {
                         unconstrained_power: None,
                     }
                 }
-                Augmented::Epr(epr) => {
-                    PowerDataObj {
-                        raw: epr.0,
-                        pdo_type: "EPR_AVS".to_string(),
-                        voltage_v: None,
-                        max_current_a: None,
-                        max_power_w: None,
-                        min_voltage_v: None,
-                        max_voltage_v: None,
-                        dual_role_power: None,
-                        usb_communications_capable: None,
-                        unconstrained_power: None,
-                    }
-                }
-                Augmented::Unknown(raw) => {
-                    PowerDataObj {
-                        raw: *raw,
-                        pdo_type: "Unknown_Augmented".to_string(),
-                        voltage_v: None,
-                        max_current_a: None,
-                        max_power_w: None,
-                        min_voltage_v: None,
-                        max_voltage_v: None,
-                        dual_role_power: None,
-                        usb_communications_capable: None,
-                        unconstrained_power: None,
-                    }
-                }
-            },
-            PowerDataObject::Unknown(raw) => {
-                PowerDataObj {
-                    raw: raw.0,
-                    pdo_type: "Unknown".to_string(),
+                Augmented::Epr(epr) => PowerDataObj {
+                    raw: epr.0,
+                    pdo_type: "EPR_AVS".to_string(),
                     voltage_v: None,
                     max_current_a: None,
                     max_power_w: None,
@@ -320,8 +330,32 @@ impl From<&PowerDataObject> for PowerDataObj {
                     dual_role_power: None,
                     usb_communications_capable: None,
                     unconstrained_power: None,
-                }
-            }
+                },
+                Augmented::Unknown(raw) => PowerDataObj {
+                    raw: *raw,
+                    pdo_type: "Unknown_Augmented".to_string(),
+                    voltage_v: None,
+                    max_current_a: None,
+                    max_power_w: None,
+                    min_voltage_v: None,
+                    max_voltage_v: None,
+                    dual_role_power: None,
+                    usb_communications_capable: None,
+                    unconstrained_power: None,
+                },
+            },
+            PowerDataObject::Unknown(raw) => PowerDataObj {
+                raw: raw.0,
+                pdo_type: "Unknown".to_string(),
+                voltage_v: None,
+                max_current_a: None,
+                max_power_w: None,
+                min_voltage_v: None,
+                max_voltage_v: None,
+                dual_role_power: None,
+                usb_communications_capable: None,
+                unconstrained_power: None,
+            },
         }
     }
 }
@@ -352,53 +386,53 @@ impl PowerDataObj {
 }
 
 /// Python wrapper for USB PD Request Data Object (RDO)
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct RequestDataObj {
     #[pyo3(get)]
     /// Raw 32-bit RDO value
     pub raw: u32,
-    
+
     #[pyo3(get)]
     /// RDO type ("FixedVariableSupply", "Battery", "PPS", "AVS", "Unknown")
     pub rdo_type: String,
-    
+
     #[pyo3(get)]
     /// PDO position (1-7) that this request refers to
     pub object_position: u8,
-    
+
     #[pyo3(get)]
     /// Operating current in amperes (for fixed/variable supply)
     pub operating_current_a: Option<f32>,
-    
+
     #[pyo3(get)]
     /// Max operating current in amperes (for fixed/variable supply)
     pub max_operating_current_a: Option<f32>,
-    
+
     #[pyo3(get)]
     /// Operating voltage in volts (for PPS/AVS)
     pub operating_voltage_v: Option<f32>,
-    
+
     #[pyo3(get)]
     /// Operating power in watts (for battery)
     pub operating_power_w: Option<f32>,
-    
+
     #[pyo3(get)]
     /// Max operating power in watts (for battery)
     pub max_operating_power_w: Option<f32>,
-    
+
     #[pyo3(get)]
     /// Capability mismatch flag
     pub capability_mismatch: bool,
-    
+
     #[pyo3(get)]
     /// USB communications capable
     pub usb_communications_capable: bool,
-    
+
     #[pyo3(get)]
     /// No USB suspend
     pub no_usb_suspend: bool,
-    
+
     #[pyo3(get)]
     /// GiveBack flag (for fixed/variable supply)
     pub giveback_flag: Option<bool>,
@@ -408,9 +442,13 @@ impl From<&request::PowerSource> for RequestDataObj {
     fn from(request: &request::PowerSource) -> Self {
         match request {
             request::PowerSource::FixedVariableSupply(req) => {
-                let operating_current_a = req.operating_current().get::<uom::si::electric_current::ampere>() as f32;
-                let max_operating_current_a = req.max_operating_current().get::<uom::si::electric_current::ampere>() as f32;
-                
+                let operating_current_a =
+                    req.operating_current()
+                        .get::<uom::si::electric_current::ampere>() as f32;
+                let max_operating_current_a =
+                    req.max_operating_current()
+                        .get::<uom::si::electric_current::ampere>() as f32;
+
                 RequestDataObj {
                     raw: req.0,
                     rdo_type: "FixedVariableSupply".to_string(),
@@ -428,8 +466,9 @@ impl From<&request::PowerSource> for RequestDataObj {
             }
             request::PowerSource::Battery(req) => {
                 let operating_power_w = req.operating_power().get::<uom::si::power::watt>() as f32;
-                let max_operating_power_w = req.max_operating_power().get::<uom::si::power::watt>() as f32;
-                
+                let max_operating_power_w =
+                    req.max_operating_power().get::<uom::si::power::watt>() as f32;
+
                 RequestDataObj {
                     raw: req.0,
                     rdo_type: "Battery".to_string(),
@@ -446,9 +485,13 @@ impl From<&request::PowerSource> for RequestDataObj {
                 }
             }
             request::PowerSource::Pps(req) => {
-                let operating_voltage_v = req.output_voltage().get::<uom::si::electric_potential::volt>() as f32;
-                let operating_current_a = req.operating_current().get::<uom::si::electric_current::ampere>() as f32;
-                
+                let operating_voltage_v =
+                    req.output_voltage()
+                        .get::<uom::si::electric_potential::volt>() as f32;
+                let operating_current_a =
+                    req.operating_current()
+                        .get::<uom::si::electric_current::ampere>() as f32;
+
                 RequestDataObj {
                     raw: req.0,
                     rdo_type: "PPS".to_string(),
@@ -465,9 +508,13 @@ impl From<&request::PowerSource> for RequestDataObj {
                 }
             }
             request::PowerSource::Avs(req) => {
-                let operating_voltage_v = req.output_voltage().get::<uom::si::electric_potential::volt>() as f32;
-                let operating_current_a = req.operating_current().get::<uom::si::electric_current::ampere>() as f32;
-                
+                let operating_voltage_v =
+                    req.output_voltage()
+                        .get::<uom::si::electric_potential::volt>() as f32;
+                let operating_current_a =
+                    req.operating_current()
+                        .get::<uom::si::electric_current::ampere>() as f32;
+
                 RequestDataObj {
                     raw: req.0,
                     rdo_type: "AVS".to_string(),
@@ -483,22 +530,41 @@ impl From<&request::PowerSource> for RequestDataObj {
                     giveback_flag: None,
                 }
             }
-            request::PowerSource::Unknown(raw) => {
-                RequestDataObj {
-                    raw: raw.0,
-                    rdo_type: "Unknown".to_string(),
-                    object_position: raw.object_position(),
-                    operating_current_a: None,
-                    max_operating_current_a: None,
-                    operating_voltage_v: None,
-                    operating_power_w: None,
-                    max_operating_power_w: None,
-                    capability_mismatch: false,
-                    usb_communications_capable: false,
-                    no_usb_suspend: false,
-                    giveback_flag: None,
-                }
+            request::PowerSource::EprRequest(epr) => {
+                // An EPR request carries the raw RDO plus a copy of the PDO it
+                // selects, so the RDO layout follows from that PDO's type.
+                let inner = match &epr.pdo {
+                    PowerDataObject::FixedSupply(_) | PowerDataObject::VariableSupply(_) => {
+                        request::PowerSource::FixedVariableSupply(request::FixedVariableSupply(
+                            epr.rdo,
+                        ))
+                    }
+                    PowerDataObject::Augmented(Augmented::Epr(_)) => {
+                        request::PowerSource::Avs(request::Avs(epr.rdo))
+                    }
+                    PowerDataObject::Augmented(Augmented::Spr(_)) => {
+                        request::PowerSource::Pps(request::Pps(epr.rdo))
+                    }
+                    _ => request::PowerSource::Unknown(request::RawDataObject(epr.rdo)),
+                };
+                let mut decoded = RequestDataObj::from(&inner);
+                decoded.rdo_type = format!("EPR_{}", decoded.rdo_type);
+                decoded
             }
+            request::PowerSource::Unknown(raw) => RequestDataObj {
+                raw: raw.0,
+                rdo_type: "Unknown".to_string(),
+                object_position: raw.object_position(),
+                operating_current_a: None,
+                max_operating_current_a: None,
+                operating_voltage_v: None,
+                operating_power_w: None,
+                max_operating_power_w: None,
+                capability_mismatch: false,
+                usb_communications_capable: false,
+                no_usb_suspend: false,
+                giveback_flag: None,
+            },
         }
     }
 }
@@ -525,7 +591,10 @@ impl RequestDataObj {
                 self.operating_power_w.unwrap_or(0.0),
                 self.max_operating_power_w.unwrap_or(0.0)
             ),
-            _ => format!("RequestDataObj(PDO {}: {})", self.object_position, self.rdo_type),
+            _ => format!(
+                "RequestDataObj(PDO {}: {})",
+                self.object_position, self.rdo_type
+            ),
         }
     }
 
@@ -534,66 +603,43 @@ impl RequestDataObj {
     }
 }
 
-/// PDO state manager for tracking Source Capabilities
-#[derive(Debug, Clone)]
-pub struct PdoStateManager {
-    /// Stored PDOs from most recent Source Capabilities message
-    pub source_capabilities: Option<SourceCapabilities>,
-}
+/// Parse a message, resolving Request PDO types against known capabilities.
+///
+/// A Request message only carries an object position, so its RDO cannot be
+/// interpreted without the Source Capabilities that preceded it. usbpd 2.0.0
+/// implements its `PdoKind` lookup for `Option<&SourceCapabilities>` directly,
+/// which replaces the state-manager type this crate used to define.
+fn parse_with_capabilities(
+    bytes: &[u8],
+    capabilities: Option<&SourceCapabilities>,
+) -> Result<Message, ParseError> {
+    let header = Header::from_bytes(&bytes[..2])?;
+    let message = Message::new(header);
 
-impl PdoStateManager {
-    pub fn new() -> Self {
-        Self {
-            source_capabilities: None,
+    match header.message_type() {
+        MessageType::Data(message_type) => {
+            Data::parse_message(message, message_type, &bytes[2..], &capabilities)
         }
-    }
-    
-    pub fn update_source_capabilities(&mut self, capabilities: SourceCapabilities) {
-        self.source_capabilities = Some(capabilities);
-    }
-}
-
-impl PdoState for PdoStateManager {
-    fn pdo_at_object_position(&self, position: u8) -> Option<Kind> {
-        if let Some(ref caps) = self.source_capabilities {
-            if position == 0 || position > 7 {
-                return None;
-            }
-            
-            let index = (position - 1) as usize;
-            caps.pdos().get(index).map(|pdo| match pdo {
-                PowerDataObject::FixedSupply(_) => Kind::FixedSupply,
-                PowerDataObject::Battery(_) => Kind::Battery,
-                PowerDataObject::VariableSupply(_) => Kind::VariableSupply,
-                PowerDataObject::Augmented(aug) => match aug {
-                    Augmented::Spr(_) => Kind::Pps,
-                    Augmented::Epr(_) => Kind::Avs,
-                    Augmented::Unknown(_) => Kind::FixedSupply, // Fallback
-                },
-                PowerDataObject::Unknown(_) => Kind::FixedSupply, // Fallback
-            })
-        } else {
-            None
-        }
+        _ => Message::from_bytes(bytes),
     }
 }
 
 /// Python wrapper for complete USB PD message
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PdMessage {
     #[pyo3(get)]
     /// Message header
     pub header: PdHeader,
-    
+
     #[pyo3(get)]
     /// Data objects (empty for control messages) - PDOs for Source Capabilities
     pub data_objects: Vec<PowerDataObj>,
-    
+
     #[pyo3(get)]
     /// Request data objects (RDOs for Request messages)
     pub request_objects: Vec<RequestDataObj>,
-    
+
     #[pyo3(get)]
     /// Raw message bytes
     pub raw_bytes: Vec<u8>,
@@ -605,8 +651,7 @@ impl PdMessage {
         let object_count = self.data_objects.len() + self.request_objects.len();
         format!(
             "PdMessage({}, {} objects)",
-            self.header.message_type,
-            object_count
+            self.header.message_type, object_count
         )
     }
 
@@ -615,21 +660,24 @@ impl PdMessage {
         result.push_str(&format!("  Message ID: {}\n", self.header.message_id));
         result.push_str(&format!("  Power Role: {}\n", self.header.port_power_role));
         result.push_str(&format!("  Data Role: {}\n", self.header.port_data_role));
-        
+
         if !self.data_objects.is_empty() {
             result.push_str(&format!("  Data Objects ({}):\n", self.data_objects.len()));
             for (i, obj) in self.data_objects.iter().enumerate() {
                 result.push_str(&format!("    {}: {}\n", i + 1, obj.__str__()));
             }
         }
-        
+
         if !self.request_objects.is_empty() {
-            result.push_str(&format!("  Request Objects ({}):\n", self.request_objects.len()));
+            result.push_str(&format!(
+                "  Request Objects ({}):\n",
+                self.request_objects.len()
+            ));
             for (i, obj) in self.request_objects.iter().enumerate() {
                 result.push_str(&format!("    {}: {}\n", i + 1, obj.__str__()));
             }
         }
-        
+
         result
     }
 
@@ -655,7 +703,7 @@ impl PdMessage {
 }
 
 /// Parse a USB PD message from raw bytes
-/// 
+///
 /// Args:
 ///     data: Raw message bytes as bytes object
 ///     
@@ -667,10 +715,12 @@ impl PdMessage {
 #[pyfunction]
 pub fn parse_pd_message(data: &Bound<'_, pyo3::types::PyBytes>) -> PyResult<PdMessage> {
     let bytes = data.as_bytes();
-    
+
     // Prevent panics on too-short input in the underlying crate
     if bytes.len() < 2 {
-        return Err(PyValueError::new_err("message too short: expected at least 2 bytes"));
+        return Err(PyValueError::new_err(
+            "message too short: expected at least 2 bytes",
+        ));
     }
 
     // Use the usbpd crate to parse the message
@@ -678,28 +728,34 @@ pub fn parse_pd_message(data: &Bound<'_, pyo3::types::PyBytes>) -> PyResult<PdMe
         Ok(message) => {
             let header = PdHeader::from(&message.header);
             let mut data_objects = Vec::new();
-            
+            let mut request_objects = Vec::new();
+
             // Validate that the payload length matches header expectations
             let expected_len = 2 + (message.header.num_objects() * 4);
             if bytes.len() < expected_len {
                 return Err(PyValueError::new_err(format!(
                     "invalid message length: expected at least {} bytes, got {}",
-                    expected_len, bytes.len()
+                    expected_len,
+                    bytes.len()
                 )));
             }
-            
+
             // Extract data objects based on message data type
-            if let Some(data) = &message.data {
+            if let Some(data) = message_data(&message) {
                 match data {
                     Data::SourceCapabilities(source_caps) => {
                         for pdo in source_caps.pdos() {
                             data_objects.push(PowerDataObj::from(pdo));
                         }
                     }
-                    Data::PowerSourceRequest(_request) => {
-                        // Basic request support without PDO state
-                        // Will be empty for now, but structure is ready
+                    // An EPR request carries a copy of the PDO it selects, so it
+                    // decodes without the preceding Source Capabilities. A plain
+                    // Request only names an object position and stays empty here;
+                    // use parse_pd_message_with_state to resolve it.
+                    Data::Request(request @ request::PowerSource::EprRequest(_)) => {
+                        request_objects.push(RequestDataObj::from(request));
                     }
+                    Data::Request(_) => {}
                     // TODO: Add support for other data types (VendorDefined, etc.)
                     _ => {
                         // For now, we only fully support Source Capabilities
@@ -707,18 +763,21 @@ pub fn parse_pd_message(data: &Bound<'_, pyo3::types::PyBytes>) -> PyResult<PdMe
                     }
                 }
             }
-            
+
             Ok(PdMessage {
                 header,
                 data_objects,
-                request_objects: Vec::new(),
+                request_objects,
                 raw_bytes: bytes.to_vec(),
             })
         }
         Err(parse_error) => {
             let error_msg = match parse_error {
                 ParseError::InvalidLength { expected, found } => {
-                    format!("Invalid message length: expected {}, found {}", expected, found)
+                    format!(
+                        "Invalid message length: expected {}, found {}",
+                        expected, found
+                    )
                 }
                 ParseError::UnsupportedSpecificationRevision(rev) => {
                     format!("Unsupported specification revision: {}", rev)
@@ -735,6 +794,9 @@ pub fn parse_pd_message(data: &Bound<'_, pyo3::types::PyBytes>) -> PyResult<PdMe
                 ParseError::Other(msg) => {
                     format!("Parse error: {}", msg)
                 }
+                // Chunked extended messages need reassembly across several
+                // messages, which a single-message parser cannot do.
+                other => format!("Parse error: {:?}", other),
             };
             Err(PyValueError::new_err(error_msg))
         }
@@ -742,7 +804,7 @@ pub fn parse_pd_message(data: &Bound<'_, pyo3::types::PyBytes>) -> PyResult<PdMe
 }
 
 /// Parse a USB PD message from raw bytes with PDO state for Request message support
-/// 
+///
 /// Args:
 ///     data: Raw message bytes as bytes object
 ///     pdo_state: Optional list of PowerDataObj from previous Source Capabilities
@@ -754,78 +816,82 @@ pub fn parse_pd_message(data: &Bound<'_, pyo3::types::PyBytes>) -> PyResult<PdMe
 ///     ValueError: If the message cannot be parsed
 #[pyfunction]
 pub fn parse_pd_message_with_state(
-    data: &Bound<'_, pyo3::types::PyBytes>, 
-    pdo_state: Option<Vec<PowerDataObj>>
+    data: &Bound<'_, pyo3::types::PyBytes>,
+    pdo_state: Option<Vec<PowerDataObj>>,
 ) -> PyResult<PdMessage> {
     let bytes = data.as_bytes();
-    
+
     // Prevent panics on too-short input
     if bytes.len() < 2 {
-        return Err(PyValueError::new_err("message too short: expected at least 2 bytes"));
+        return Err(PyValueError::new_err(
+            "message too short: expected at least 2 bytes",
+        ));
     }
 
-    // Create PDO state manager
-    let mut state_manager = PdoStateManager::new();
-    
+    // Capabilities the caller supplied, used to resolve a Request RDO
+    let mut capabilities: Option<SourceCapabilities> = None;
+
     // If PDO state is provided, convert to SourceCapabilities
-    if let Some(ref pdos) = pdo_state {
-        if !pdos.is_empty() && pdos.len() <= 7 {
-            // Build a proper PD header for Source_Capabilities with correct num_objects
-            // USB PD Header format (16-bit little-endian):
-            // Bits 0-4: Message type (1 = Source_Capabilities for data messages)
-            // Bit 5: Port data role (1 = DFP)
-            // Bits 6-7: Spec revision (2 = PD3.0)
-            // Bit 8: Port power role (1 = Source)
-            // Bits 9-11: Message ID (0)
-            // Bits 12-14: Number of data objects
-            // Bit 15: Extended (0)
-            let num_objects = pdos.len() as u16;
-            let header: u16 = 1                    // message_type = Source_Capabilities
+    if let Some(ref pdos) = pdo_state
+        && !pdos.is_empty()
+        && pdos.len() <= 7
+    {
+        // Build a proper PD header for Source_Capabilities with correct num_objects
+        // USB PD Header format (16-bit little-endian):
+        // Bits 0-4: Message type (1 = Source_Capabilities for data messages)
+        // Bit 5: Port data role (1 = DFP)
+        // Bits 6-7: Spec revision (2 = PD3.0)
+        // Bit 8: Port power role (1 = Source)
+        // Bits 9-11: Message ID (0)
+        // Bits 12-14: Number of data objects
+        // Bit 15: Extended (0)
+        let num_objects = pdos.len() as u16;
+        let header: u16 = 1                    // message_type = Source_Capabilities
                 | (1 << 5)                         // port_data_role = DFP
                 | (2 << 6)                         // spec_revision = PD3.0
                 | (1 << 8)                         // port_power_role = Source
-                | (num_objects << 12);             // num_data_objects
+                | (num_objects << 12); // num_data_objects
 
-            // Build dummy message bytes: header (2 bytes) + PDOs (4 bytes each)
-            let mut dummy_bytes = header.to_le_bytes().to_vec();
-            for pdo in pdos {
-                dummy_bytes.extend_from_slice(&pdo.raw.to_le_bytes());
-            }
+        // Build dummy message bytes: header (2 bytes) + PDOs (4 bytes each)
+        let mut dummy_bytes = header.to_le_bytes().to_vec();
+        for pdo in pdos {
+            dummy_bytes.extend_from_slice(&pdo.raw.to_le_bytes());
+        }
 
-            // Parse to extract SourceCapabilities
-            if let Ok(dummy_msg) = Message::from_bytes(&dummy_bytes) {
-                if let Some(Data::SourceCapabilities(caps)) = dummy_msg.data {
-                    state_manager.update_source_capabilities(caps);
-                }
-            }
+        // Parse to extract SourceCapabilities
+        if let Ok(dummy_msg) = Message::from_bytes(&dummy_bytes)
+            && let Some(Data::SourceCapabilities(caps)) = message_data(&dummy_msg)
+        {
+            capabilities = Some(caps.clone());
         }
     }
 
     // Use the usbpd crate to parse the message with state
-    match Message::from_bytes_with_state(bytes, &state_manager) {
+    match parse_with_capabilities(bytes, capabilities.as_ref()) {
         Ok(message) => {
             let header = PdHeader::from(&message.header);
             let mut data_objects = Vec::new();
             let mut request_objects = Vec::new();
-            
+
             // Validate that the payload length matches header expectations
             let expected_len = 2 + (message.header.num_objects() * 4);
             if bytes.len() < expected_len {
                 return Err(PyValueError::new_err(format!(
                     "invalid message length: expected at least {} bytes, got {}",
-                    expected_len, bytes.len()
+                    expected_len,
+                    bytes.len()
                 )));
             }
-            
+
             // Extract data objects based on message data type
-            if let Some(data) = &message.data {
+            if let Some(data) = message_data(&message) {
                 match data {
                     Data::SourceCapabilities(source_caps) => {
                         for pdo in source_caps.pdos() {
                             data_objects.push(PowerDataObj::from(pdo));
                         }
                     }
-                    Data::PowerSourceRequest(request) => {
+                    Data::Request(request) => {
                         request_objects.push(RequestDataObj::from(request));
                     }
                     // TODO: Add support for other data types (VendorDefined, etc.)
@@ -835,7 +901,7 @@ pub fn parse_pd_message_with_state(
                     }
                 }
             }
-            
+
             Ok(PdMessage {
                 header,
                 data_objects,
@@ -846,7 +912,10 @@ pub fn parse_pd_message_with_state(
         Err(parse_error) => {
             let error_msg = match parse_error {
                 ParseError::InvalidLength { expected, found } => {
-                    format!("Invalid message length: expected {}, found {}", expected, found)
+                    format!(
+                        "Invalid message length: expected {}, found {}",
+                        expected, found
+                    )
                 }
                 ParseError::UnsupportedSpecificationRevision(rev) => {
                     format!("Unsupported specification revision: {}", rev)
@@ -863,6 +932,9 @@ pub fn parse_pd_message_with_state(
                 ParseError::Other(msg) => {
                     format!("Parse error: {}", msg)
                 }
+                // Chunked extended messages need reassembly across several
+                // messages, which a single-message parser cannot do.
+                other => format!("Parse error: {:?}", other),
             };
             Err(PyValueError::new_err(error_msg))
         }
@@ -870,7 +942,7 @@ pub fn parse_pd_message_with_state(
 }
 
 /// Parse multiple USB PD messages from a list of byte arrays
-/// 
+///
 /// Args:
 ///     messages: List of bytes objects containing raw message data
 ///     
@@ -882,10 +954,10 @@ pub fn parse_pd_message_with_state(
 #[pyfunction]
 pub fn parse_messages(messages: &Bound<'_, pyo3::types::PyList>) -> PyResult<Vec<PdMessage>> {
     let mut parsed_messages = Vec::new();
-    
+
     for item in messages.iter() {
-        if let Ok(bytes) = item.downcast::<pyo3::types::PyBytes>() {
-            match parse_pd_message(&bytes) {
+        if let Ok(bytes) = item.cast::<pyo3::types::PyBytes>() {
+            match parse_pd_message(bytes) {
                 Ok(msg) => parsed_messages.push(msg),
                 Err(_) => {
                     // Skip failed messages, continue with others
@@ -896,12 +968,12 @@ pub fn parse_messages(messages: &Bound<'_, pyo3::types::PyList>) -> PyResult<Vec
             return Err(PyTypeError::new_err("All items must be bytes objects"));
         }
     }
-    
+
     Ok(parsed_messages)
 }
 
 /// Convert a hex string to bytes
-/// 
+///
 /// Args:
 ///     hex_str: Hexadecimal string (with or without spaces/separators)
 ///     
@@ -913,12 +985,11 @@ pub fn parse_messages(messages: &Bound<'_, pyo3::types::PyList>) -> PyResult<Vec
 #[pyfunction]
 pub fn hex_to_bytes(hex_str: &str) -> PyResult<Vec<u8>> {
     let cleaned = hex_str.replace(" ", "").replace("-", "").replace(":", "");
-    hex::decode(cleaned)
-        .map_err(|e| PyValueError::new_err(format!("Invalid hex string: {}", e)))
+    hex::decode(cleaned).map_err(|e| PyValueError::new_err(format!("Invalid hex string: {}", e)))
 }
 
 /// Convert bytes to a hex string
-/// 
+///
 /// Args:
 ///     data: Raw bytes
 ///     
@@ -930,11 +1001,11 @@ pub fn bytes_to_hex(data: &Bound<'_, pyo3::types::PyBytes>) -> String {
 }
 
 /// Get human-readable message type name based on message type and number of data objects
-/// 
+///
 /// This function correctly distinguishes between control and data messages:
 /// - Control messages have num_data_objects = 0
 /// - Data messages have num_data_objects > 0
-/// 
+///
 /// Args:
 ///     message_type: Raw message type value (0-31)
 ///     num_data_objects: Number of data objects (0-7)
@@ -994,14 +1065,14 @@ pub fn get_message_type_name(message_type: u8, num_data_objects: u8) -> String {
 }
 
 /// usbpdpy - Python bindings for USB Power Delivery message parsing
-/// 
-/// This module provides fast and accurate USB PD message parsing using 
+///
+/// This module provides fast and accurate USB PD message parsing using
 /// the proven usbpd Rust crate.
 #[pymodule]
 fn usbpdpy(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add("__version__", "0.1.0")?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("__author__", "Danila Gornushko <me@okhsunrog.dev>")?;
-    
+
     // Functions
     m.add_function(wrap_pyfunction!(parse_pd_message, m)?)?;
     m.add_function(wrap_pyfunction!(parse_pd_message_with_state, m)?)?;
@@ -1009,15 +1080,15 @@ fn usbpdpy(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_message_type_name, m)?)?;
     m.add_function(wrap_pyfunction!(hex_to_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(bytes_to_hex, m)?)?;
-    
+
     // Add alias for backwards compatibility
     m.add("parse_message", m.getattr("parse_pd_message")?)?;
-    
+
     // Classes
     m.add_class::<PdMessage>()?;
     m.add_class::<PdHeader>()?;
     m.add_class::<PowerDataObj>()?;
     m.add_class::<RequestDataObj>()?;
-    
+
     Ok(())
 }

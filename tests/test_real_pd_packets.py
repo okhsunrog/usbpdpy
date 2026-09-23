@@ -258,6 +258,38 @@ class TestRequestMessage:
         print(f"✅ Request with PDO state: requesting PDO #{rdo.object_position}")
 
 
+# Source: km003c-protocol-research, capture pd_epr0.9 - a sink requesting the
+# 28 V / 5 A (140 W) EPR fixed PDO at object position 8.
+EPR_REQUEST_HEX = "8926f4d14781f4c10800"
+
+
+class TestEprRequest:
+    """EPR_Request carries a copy of the PDO it selects, so it is self-describing."""
+
+    def assert_epr_fixed_request(self, message):
+        assert message.header.message_type == "EPR_Request"
+        assert len(message.request_objects) == 1
+
+        rdo = message.request_objects[0]
+        assert rdo.rdo_type == "EPR_FixedVariableSupply"
+        assert rdo.object_position == 8
+        assert rdo.operating_current_a == pytest.approx(5.0)
+        assert rdo.max_operating_current_a == pytest.approx(5.0)
+
+    def test_decodes_without_source_capabilities(self):
+        # A plain Request needs the preceding Source_Capabilities to be
+        # interpreted; an EPR_Request does not, so the stateless parser can
+        # and should decode it.
+        self.assert_epr_fixed_request(
+            usbpdpy.parse_pd_message(bytes.fromhex(EPR_REQUEST_HEX))
+        )
+
+    def test_decodes_with_the_stateful_parser_too(self):
+        self.assert_epr_fixed_request(
+            usbpdpy.parse_pd_message_with_state(bytes.fromhex(EPR_REQUEST_HEX), None)
+        )
+
+
 class TestControlMessages:
     """Test various control messages"""
 
