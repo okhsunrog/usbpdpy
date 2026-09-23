@@ -8,6 +8,7 @@ Python bindings for USB Power Delivery message parsing using the [`usbpd`](https
 - Support for Source Capabilities and Request message parsing
 - All PDO types: Fixed Supply, Battery, Variable Supply, PPS, EPR
 - Complete RDO (Request Data Object) parsing with PDO state management
+- Reassembly of chunked EPR_Source_Capabilities messages
 - Message header parsing with proper control/data message classification
 - Python type hints and error handling
 
@@ -60,6 +61,24 @@ for rdo in request_msg.request_objects:
     # Output: Requesting PDO #2: FixedVariableSupply
 ```
 
+### Decode a Whole Connection
+
+`PdDecoder` remembers the last Source Capabilities, so Requests resolve
+without passing PDO state around, and it reassembles chunked
+EPR_Source_Capabilities messages, which no single-message parser can decode.
+`decode()` returns `None` for a chunk that does not complete its message yet
+and for a chunk request.
+
+```python
+decoder = usbpdpy.PdDecoder()
+for wire in wire_messages:  # the bytes of each message, in capture order
+    message = decoder.decode(wire)
+    if message is not None:
+        print(message.header.message_type, message.data_objects)
+
+decoder.reset()  # on disconnect or hard reset
+```
+
 ## API Reference
 
 ### Core Functions
@@ -67,6 +86,7 @@ for rdo in request_msg.request_objects:
 - `parse_pd_message(data: bytes) -> PdMessage` - Parse a USB PD message
 - `parse_pd_message_with_state(data: bytes, pdo_state: List[PowerDataObj]) -> PdMessage` - Parse with PDO context for Request messages
 - `parse_messages(messages: List[bytes]) -> List[PdMessage]` - Parse multiple messages
+- `PdDecoder()` - Stateful decoder for one connection: `decode(data: bytes) -> Optional[PdMessage]`, `reset()`, `source_capabilities: List[PowerDataObj]`
 - `get_message_type_name(msg_type: int, num_objects: int) -> str` - Get human-readable message type
 - `hex_to_bytes(hex_str: str) -> List[int]` - Convert hex string to byte list
 - `bytes_to_hex(data: bytes) -> str` - Convert bytes to hex string

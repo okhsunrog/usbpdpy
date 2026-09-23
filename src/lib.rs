@@ -35,6 +35,8 @@ use usbpd::protocol_layer::message::{
     Message, ParseError, Payload,
     data::source_capabilities::{Augmented, PowerDataObject, SourceCapabilities},
     data::{Data, request},
+    extended::Extended,
+    extended::chunked::{ChunkResult, ChunkedMessageAssembler},
     header::{
         ControlMessageType, DataMessageType, ExtendedMessageType, Header, MessageType,
         SpecificationRevision,
@@ -702,105 +704,111 @@ impl PdMessage {
     }
 }
 
-/// Parse a USB PD message from raw bytes
-///
-/// Args:
-///     data: Raw message bytes as bytes object
-///     
-/// Returns:
-///     PdMessage: Parsed USB PD message
-///     
-/// Raises:
-///     ValueError: If the message cannot be parsed
-#[pyfunction]
-pub fn parse_pd_message(data: &Bound<'_, pyo3::types::PyBytes>) -> PyResult<PdMessage> {
-    let bytes = data.as_bytes();
-
-    // Prevent panics on too-short input in the underlying crate
+/// Reject input the underlying crate would panic on.
+fn check_min_length(bytes: &[u8]) -> PyResult<()> {
     if bytes.len() < 2 {
         return Err(PyValueError::new_err(
             "message too short: expected at least 2 bytes",
         ));
     }
+    Ok(())
+}
 
-    // Use the usbpd crate to parse the message
-    match Message::from_bytes(bytes) {
-        Ok(message) => {
-            let header = PdHeader::from(&message.header);
-            let mut data_objects = Vec::new();
-            let mut request_objects = Vec::new();
-
-            // Validate that the payload length matches header expectations
-            let expected_len = 2 + (message.header.num_objects() * 4);
-            if bytes.len() < expected_len {
-                return Err(PyValueError::new_err(format!(
-                    "invalid message length: expected at least {} bytes, got {}",
-                    expected_len,
-                    bytes.len()
-                )));
-            }
-
-            // Extract data objects based on message data type
-            if let Some(data) = message_data(&message) {
-                match data {
-                    Data::SourceCapabilities(source_caps) => {
-                        for pdo in source_caps.pdos() {
-                            data_objects.push(PowerDataObj::from(pdo));
-                        }
-                    }
-                    // An EPR request carries a copy of the PDO it selects, so it
-                    // decodes without the preceding Source Capabilities. A plain
-                    // Request only names an object position and stays empty here;
-                    // use parse_pd_message_with_state to resolve it.
-                    Data::Request(request @ request::PowerSource::EprRequest(_)) => {
-                        request_objects.push(RequestDataObj::from(request));
-                    }
-                    Data::Request(_) => {}
-                    // TODO: Add support for other data types (VendorDefined, etc.)
-                    _ => {
-                        // For now, we only fully support Source Capabilities
-                        // Other message types will have empty data_objects
-                    }
-                }
-            }
-
-            Ok(PdMessage {
-                header,
-                data_objects,
-                request_objects,
-                raw_bytes: bytes.to_vec(),
-            })
+/// Turn a usbpd parse error into the ValueError raised to Python.
+fn parse_error_to_py(parse_error: ParseError) -> PyErr {
+    let error_msg = match parse_error {
+        ParseError::InvalidLength { expected, found } => {
+            format!(
+                "Invalid message length: expected {}, found {}",
+                expected, found
+            )
         }
-        Err(parse_error) => {
-            let error_msg = match parse_error {
-                ParseError::InvalidLength { expected, found } => {
-                    format!(
-                        "Invalid message length: expected {}, found {}",
-                        expected, found
-                    )
-                }
-                ParseError::UnsupportedSpecificationRevision(rev) => {
-                    format!("Unsupported specification revision: {}", rev)
-                }
-                ParseError::InvalidMessageType(msg_type) => {
-                    format!("Invalid message type: {}", msg_type)
-                }
-                ParseError::InvalidDataMessageType(msg_type) => {
-                    format!("Invalid data message type: {}", msg_type)
-                }
-                ParseError::InvalidControlMessageType(msg_type) => {
-                    format!("Invalid control message type: {}", msg_type)
-                }
-                ParseError::Other(msg) => {
-                    format!("Parse error: {}", msg)
-                }
-                // Chunked extended messages need reassembly across several
-                // messages, which a single-message parser cannot do.
-                other => format!("Parse error: {:?}", other),
-            };
-            Err(PyValueError::new_err(error_msg))
+        ParseError::UnsupportedSpecificationRevision(rev) => {
+            format!("Unsupported specification revision: {}", rev)
         }
+        ParseError::InvalidMessageType(msg_type) => {
+            format!("Invalid message type: {}", msg_type)
+        }
+        ParseError::InvalidDataMessageType(msg_type) => {
+            format!("Invalid data message type: {}", msg_type)
+        }
+        ParseError::InvalidControlMessageType(msg_type) => {
+            format!("Invalid control message type: {}", msg_type)
+        }
+        ParseError::Other(msg) => {
+            format!("Parse error: {}", msg)
+        }
+        // Chunked extended messages need reassembly across several
+        // messages, which only PdDecoder can do.
+        other => format!("Parse error: {:?}", other),
+    };
+    PyValueError::new_err(error_msg)
+}
+
+/// Build the Python view of a parsed message.
+///
+/// `resolve_requests` is false when no Source Capabilities were available: a
+/// plain Request only names an object position, so its RDO stays out of
+/// `request_objects`. An EPR request carries a copy of the PDO it selects and
+/// decodes either way.
+fn to_py_message(message: &Message, bytes: &[u8], resolve_requests: bool) -> PyResult<PdMessage> {
+    // Validate that the payload length matches header expectations
+    let expected_len = 2 + (message.header.num_objects() * 4);
+    if bytes.len() < expected_len {
+        return Err(PyValueError::new_err(format!(
+            "invalid message length: expected at least {} bytes, got {}",
+            expected_len,
+            bytes.len()
+        )));
     }
+
+    let mut data_objects = Vec::new();
+    let mut request_objects = Vec::new();
+
+    match &message.payload {
+        Some(Payload::Data(Data::SourceCapabilities(source_caps))) => {
+            data_objects.extend(source_caps.pdos().iter().map(PowerDataObj::from));
+        }
+        Some(Payload::Data(Data::Request(request @ request::PowerSource::EprRequest(_)))) => {
+            request_objects.push(RequestDataObj::from(request));
+        }
+        Some(Payload::Data(Data::Request(request))) if resolve_requests => {
+            request_objects.push(RequestDataObj::from(request));
+        }
+        Some(Payload::Extended(Extended::EprSourceCapabilities(pdos))) => {
+            data_objects.extend(pdos.iter().map(PowerDataObj::from));
+        }
+        // TODO: Add support for other data types (VendorDefined, etc.)
+        _ => {}
+    }
+
+    Ok(PdMessage {
+        header: PdHeader::from(&message.header),
+        data_objects,
+        request_objects,
+        raw_bytes: bytes.to_vec(),
+    })
+}
+
+/// Parse a USB PD message from raw bytes
+///
+/// Args:
+///     data: Raw message bytes as bytes object
+///
+/// Returns:
+///     PdMessage: Parsed USB PD message
+///
+/// Raises:
+///     ValueError: If the message cannot be parsed
+#[pyfunction]
+pub fn parse_pd_message(data: &Bound<'_, pyo3::types::PyBytes>) -> PyResult<PdMessage> {
+    let bytes = data.as_bytes();
+    check_min_length(bytes)?;
+
+    let message = Message::from_bytes(bytes).map_err(parse_error_to_py)?;
+    // A plain Request stays unresolved here; use parse_pd_message_with_state
+    // or PdDecoder to interpret it.
+    to_py_message(&message, bytes, false)
 }
 
 /// Parse a USB PD message from raw bytes with PDO state for Request message support
@@ -820,13 +828,7 @@ pub fn parse_pd_message_with_state(
     pdo_state: Option<Vec<PowerDataObj>>,
 ) -> PyResult<PdMessage> {
     let bytes = data.as_bytes();
-
-    // Prevent panics on too-short input
-    if bytes.len() < 2 {
-        return Err(PyValueError::new_err(
-            "message too short: expected at least 2 bytes",
-        ));
-    }
+    check_min_length(bytes)?;
 
     // Capabilities the caller supplied, used to resolve a Request RDO
     let mut capabilities: Option<SourceCapabilities> = None;
@@ -866,77 +868,127 @@ pub fn parse_pd_message_with_state(
         }
     }
 
-    // Use the usbpd crate to parse the message with state
-    match parse_with_capabilities(bytes, capabilities.as_ref()) {
-        Ok(message) => {
-            let header = PdHeader::from(&message.header);
-            let mut data_objects = Vec::new();
-            let mut request_objects = Vec::new();
+    let message =
+        parse_with_capabilities(bytes, capabilities.as_ref()).map_err(parse_error_to_py)?;
+    to_py_message(&message, bytes, true)
+}
 
-            // Validate that the payload length matches header expectations
-            let expected_len = 2 + (message.header.num_objects() * 4);
-            if bytes.len() < expected_len {
-                return Err(PyValueError::new_err(format!(
-                    "invalid message length: expected at least {} bytes, got {}",
-                    expected_len,
-                    bytes.len()
-                )));
-            }
+/// Stateful decoder for a sequence of USB PD messages from one connection.
+///
+/// It remembers the most recent Source Capabilities, so a later Request is
+/// resolved against the PDO it selects, and reassembles chunked
+/// EPR_Source_Capabilities messages, which no single-message parser can
+/// decode. Call ``reset()`` when the connection is re-established.
+///
+/// Example:
+///     decoder = usbpdpy.PdDecoder()
+///     for wire in wire_messages:
+///         message = decoder.decode(wire)
+///         if message is not None:
+///             print(message)
+#[pyclass(skip_from_py_object)]
+#[derive(Debug, Clone, Default)]
+pub struct PdDecoder {
+    source_capabilities: Option<SourceCapabilities>,
+    assembler: ChunkedMessageAssembler,
+}
 
-            // Extract data objects based on message data type
-            if let Some(data) = message_data(&message) {
-                match data {
-                    Data::SourceCapabilities(source_caps) => {
-                        for pdo in source_caps.pdos() {
-                            data_objects.push(PowerDataObj::from(pdo));
-                        }
-                    }
-                    Data::Request(request) => {
-                        request_objects.push(RequestDataObj::from(request));
-                    }
-                    // TODO: Add support for other data types (VendorDefined, etc.)
-                    _ => {
-                        // For now, we only fully support Source Capabilities and Request
-                        // Other message types will have empty data_objects
-                    }
+#[pymethods]
+impl PdDecoder {
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Forget the Source Capabilities and any partly assembled message.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// PDOs of the most recent Source Capabilities, empty before the first one.
+    #[getter]
+    fn source_capabilities(&self) -> Vec<PowerDataObj> {
+        self.source_capabilities
+            .iter()
+            .flat_map(|caps| caps.pdos().iter().map(PowerDataObj::from))
+            .collect()
+    }
+
+    /// Decode the next message of the connection.
+    ///
+    /// Args:
+    ///     data: Raw message bytes
+    ///
+    /// Returns:
+    ///     PdMessage | None: The decoded message, or ``None`` for a chunk that
+    ///     does not complete its extended message yet and for a chunk request.
+    ///     A reassembled message keeps the wire bytes of its final chunk in
+    ///     ``raw_bytes``.
+    ///
+    /// Raises:
+    ///     ValueError: If the message cannot be parsed. A malformed chunk also
+    ///     discards the message being assembled.
+    fn decode(&mut self, data: &Bound<'_, pyo3::types::PyBytes>) -> PyResult<Option<PdMessage>> {
+        let bytes = data.as_bytes();
+        check_min_length(bytes)?;
+
+        match parse_with_capabilities(bytes, self.source_capabilities.as_ref()) {
+            Ok(message) => {
+                if let Some(Data::SourceCapabilities(caps)) = message_data(&message) {
+                    self.source_capabilities = Some(caps.clone());
                 }
+                to_py_message(&message, bytes, self.source_capabilities.is_some()).map(Some)
             }
-
-            Ok(PdMessage {
-                header,
-                data_objects,
-                request_objects,
-                raw_bytes: bytes.to_vec(),
-            })
+            Err(ParseError::ChunkedExtendedMessage {
+                request_chunk: true,
+                ..
+            }) => Ok(None),
+            Err(ParseError::ChunkedExtendedMessage {
+                chunk_number,
+                message_type,
+                ..
+            }) => {
+                // A new first chunk supersedes a message the peer abandoned.
+                if chunk_number == 0 {
+                    self.assembler.reset();
+                }
+                self.decode_chunk(bytes, message_type)
+            }
+            Err(parse_error) => Err(parse_error_to_py(parse_error)),
         }
-        Err(parse_error) => {
-            let error_msg = match parse_error {
-                ParseError::InvalidLength { expected, found } => {
-                    format!(
-                        "Invalid message length: expected {}, found {}",
-                        expected, found
-                    )
-                }
-                ParseError::UnsupportedSpecificationRevision(rev) => {
-                    format!("Unsupported specification revision: {}", rev)
-                }
-                ParseError::InvalidMessageType(msg_type) => {
-                    format!("Invalid message type: {}", msg_type)
-                }
-                ParseError::InvalidDataMessageType(msg_type) => {
-                    format!("Invalid data message type: {}", msg_type)
-                }
-                ParseError::InvalidControlMessageType(msg_type) => {
-                    format!("Invalid control message type: {}", msg_type)
-                }
-                ParseError::Other(msg) => {
-                    format!("Parse error: {}", msg)
-                }
-                // Chunked extended messages need reassembly across several
-                // messages, which a single-message parser cannot do.
-                other => format!("Parse error: {:?}", other),
-            };
-            Err(PyValueError::new_err(error_msg))
+    }
+}
+
+impl PdDecoder {
+    fn decode_chunk(
+        &mut self,
+        bytes: &[u8],
+        message_type: ExtendedMessageType,
+    ) -> PyResult<Option<PdMessage>> {
+        let result = Message::parse_extended_chunk(bytes).and_then(
+            |(header, extended_header, chunk_data)| {
+                self.assembler
+                    .process_chunk(header, extended_header, chunk_data)
+                    .map(|result| (header, result))
+            },
+        );
+
+        match result {
+            Ok((header, ChunkResult::Complete(payload))) => {
+                let message = Message {
+                    header,
+                    payload: Some(Payload::Extended(Message::parse_extended_payload(
+                        message_type,
+                        &payload,
+                    ))),
+                };
+                to_py_message(&message, bytes, true).map(Some)
+            }
+            Ok((_, ChunkResult::NeedMoreChunks(_) | ChunkResult::ChunkRequested(_))) => Ok(None),
+            Err(parse_error) => {
+                self.assembler.reset();
+                Err(parse_error_to_py(parse_error))
+            }
         }
     }
 }
@@ -1086,6 +1138,7 @@ fn usbpdpy(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
 
     // Classes
     m.add_class::<PdMessage>()?;
+    m.add_class::<PdDecoder>()?;
     m.add_class::<PdHeader>()?;
     m.add_class::<PowerDataObj>()?;
     m.add_class::<RequestDataObj>()?;
